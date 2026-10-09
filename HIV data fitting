@@ -1,0 +1,182 @@
+
+import numpy as np
+import pandas as pd
+from scipy.integrate import odeint
+from scipy.optimize import minimize
+import matplotlib.pyplot as plt
+from matplotlib.dates import DateFormatter
+
+# =============================================================================
+# HIV-AIDS Compartmental Model:  S -> Ih (HIV) -> Ia (AIDS)
+#
+# Fitting target: observed Cases = Ih + Ia  (combined active prevalence)
+# Initial total infected: Ih0 + Ia0 = 96565
+# =============================================================================
+
+def seir_model(y, t, beta_h, kappa, delta_h):
+    S, Ih, Ia = y
+    N = S + Ih + Ia
+
+    Lambda = 151002   # Annual recruitment into susceptible population
+    mu     = 0.0012   # Natural mortality rate
+
+    lambda_h = beta_h * (Ih + Ia) / N   # Force of infection
+
+    dSdt  = Lambda - (lambda_h + mu) * S
+    dIhdt = lambda_h * S - (kappa + mu) * Ih   # HIV stage
+    dIadt = kappa * Ih  - (delta_h + mu) * Ia  # AIDS stage
+
+    return [dSdt, dIhdt, dIadt]
+
+
+def neg_log_likelihood(params, t, observed_combined):
+    """
+    Minimise squared residuals between observed (Ih+Ia) and predicted (Ih+Ia).
+    params = [beta_h, kappa, delta_h, Ih0, Ia0]
+    Constraint enforced inside: Ih0 + Ia0 <= 96565
+    """
+    beta_h, kappa, delta_h, Ih0, Ia0 = params
+
+    S0 = 1250345700
+    y0 = [S0, Ih0, Ia0]
+
+    try:
+        sol = odeint(seir_model, y0, t, args=(beta_h, kappa, delta_h),
+                     mxstep=5000, full_output=False)
+        predicted = sol[:, 1] + sol[:, 2]   # Ih + Ia at each time point
+        sse = np.sum((observed_combined - predicted) ** 2)
+    except Exception:
+        sse = 1e18
+
+    return sse
+
+
+# ---------------------------------------------------------------------------
+# Load data
+# ---------------------------------------------------------------------------
+file_name = '/content/HIV_2010_2023.xlsx'   # <-- update path if needed
+df = pd.read_excel(file_name)
+
+df['Months'] = pd.to_datetime(df['Months'], format='%Y')
+df = df.dropna(subset=['Months'])
+
+min_year = df['Months'].dt.year.min()
+df['YearsSinceMin'] = (df['Months'].dt.year - min_year) * 12 + \
+                      (df['Months'].dt.month - df['Months'].dt.month.iloc[0])
+
+t                = df['YearsSinceMin'].values.astype(float)
+observed_cases   = df['Cases'].values.astype(float)   # = Ih + Ia combined
+
+# ---------------------------------------------------------------------------
+# Parameter estimation
+# ---------------------------------------------------------------------------
+# Initial guess: [beta_h, kappa, delta_h, Ih0, Ia0]
+# Constraint: Ih0 + Ia0 = 96565  (split ~60% HIV, ~40% AIDS as starting guess)
+TOTAL_INIT = 96565
+initial_guess = [0.46, 0.2456, 0.2508,
+                 int(0.60 * TOTAL_INIT),   # Ih0
+                 int(0.40 * TOTAL_INIT)]   # Ia0
+
+bounds = [
+    (1e-4, 1.0),                   # beta_h
+    (1e-4, 1.0),                   # kappa
+    (1e-4, 1.0),                   # delta_h
+    (1,    TOTAL_INIT - 1),        # Ih0  (must leave room for Ia0 >= 1)
+    (1,    TOTAL_INIT - 1),        # Ia0
+]
+
+# Soft constraint: penalise if Ih0 + Ia0 deviates from TOTAL_INIT
+def objective(params):
+    beta_h, kappa, delta_h, Ih0, Ia0 = params
+    penalty = 1e6 * (Ih0 + Ia0 - TOTAL_INIT) ** 2  # force sum == 96565
+    return neg_log_likelihood(params, t, observed_cases) + penalty
+
+print("Starting parameter estimation (fitting Ih + Ia = observed cases) ...")
+result = minimize(
+    objective,
+    initial_guess,
+    bounds=bounds,
+    method='L-BFGS-B',
+    options={'maxiter': 5000, 'ftol': 1e-12, 'gtol': 1e-10, 'disp': True}
+)
+params = result.x
+beta_h, kappa, delta_h, Ih0_est, Ia0_est = params
+
+# Normalise Ih0/Ia0 exactly to 96565 after optimisation
+scale = TOTAL_INIT / (Ih0_est + Ia0_est)
+Ih0_est *= scale
+Ia0_est *= scale
+
+print(f"\nIh0 + Ia0 (after normalisation): {Ih0_est + Ia0_est:.2f}  (target {TOTAL_INIT})")
+
+# ---------------------------------------------------------------------------
+# Final simulation with estimated parameters
+# ---------------------------------------------------------------------------
+S0 = 1250345700
+y0 = [S0, Ih0_est, Ia0_est]
+
+solution = odeint(seir_model, y0, t,
+                  args=(beta_h, kappa, delta_h),
+                  mxstep=5000)
+
+Ih_fit = solution[:, 1]
+Ia_fit = solution[:, 2]
+IhIa_fit = Ih_fit + Ia_fit   # Combined fitted curve
+
+# ---------------------------------------------------------------------------
+# Goodness-of-fit
+# ---------------------------------------------------------------------------
+ss_res = np.sum((observed_cases - IhIa_fit) ** 2)
+ss_tot = np.sum((observed_cases - np.mean(observed_cases)) ** 2)
+r_squared = 1 - ss_res / ss_tot
+
+# ---------------------------------------------------------------------------
+# Plot
+# ---------------------------------------------------------------------------
+plt.figure(figsize=(12, 8))
+
+plt.plot(df['Months'], observed_cases, 'go-',
+         label='Observed Cases (HIV + AIDS)', ms=7)
+plt.plot(df['Months'], IhIa_fit, 'r-',
+         label='Fitted Curve (Ih + Ia)', linewidth=2.5)
+plt.plot(df['Months'], Ih_fit, 'b--',
+         label='HIV Stage (Ih) — estimated', linewidth=1.8)
+plt.plot(df['Months'], Ia_fit, 'm--',
+         label='AIDS Stage (Ia) — estimated', linewidth=1.8)
+
+plt.xlabel('Year', fontsize=12, fontweight='bold')
+plt.ylabel('Active Infected Cases (Ih + Ia)', fontsize=12, fontweight='bold')
+plt.title('HIV-AIDS Model: Combined Ih + Ia Fitted to Observed Cases',
+          fontsize=13, fontweight='bold')
+
+plt.gca().xaxis.set_major_formatter(DateFormatter('%Y'))
+plt.xticks(rotation=45, fontsize=10, fontweight='bold')
+plt.yticks(fontsize=10, fontweight='bold')
+plt.legend(fontsize=10, prop={'weight': 'bold'})
+plt.tight_layout()
+plt.savefig('fitted_curve_IhIa.eps')
+plt.savefig('fitted_curve_IhIa.png', dpi=150)
+plt.show()
+
+# ---------------------------------------------------------------------------
+# Results summary
+# ---------------------------------------------------------------------------
+print("\n" + "=" * 50)
+print("ESTIMATED PARAMETERS")
+print("=" * 50)
+param_names = ["beta_h", "kappa", "delta_h", "Ih0", "Ia0"]
+for name, value in zip(param_names, [beta_h, kappa, delta_h, Ih0_est, Ia0_est]):
+    print(f"  {name:<10}: {value:.6f}")
+
+print("\nINITIAL CONDITIONS")
+print(f"  S0         : {S0}")
+print(f"  Ih0        : {Ih0_est:.2f}   (HIV at t=0)")
+print(f"  Ia0        : {Ia0_est:.2f}   (AIDS at t=0)")
+print(f"  Ih0 + Ia0  : {Ih0_est + Ia0_est:.2f}   (= {TOTAL_INIT} total infected)")
+
+print(f"\nR-squared    : {r_squared:.6f}")
+
+# Basic reproduction number  R0 = beta_h / (kappa + mu)
+mu = 0.0012
+R0 = beta_h / (kappa + mu)
+print(f"R0 (approx)  : {R0:.4f}   [beta_h / (kappa + mu)]")
